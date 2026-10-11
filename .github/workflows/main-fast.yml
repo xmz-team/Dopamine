@@ -2,6 +2,7 @@ name: "Dopamine: build and upload(fast)"
 
 on:
   workflow_dispatch:
+  push:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
