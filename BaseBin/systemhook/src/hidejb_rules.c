@@ -225,6 +225,14 @@ static const char *gJailbreakPathMarkers[] = {
 	".installed_dopamine",
 };
 
+static inline bool hidejb_rules_matches_marker(const char *name)
+{
+	for (size_t i = 0; i < sizeof(gJailbreakPathMarkers)/sizeof(gJailbreakPathMarkers[0]); i++) {
+		if (strstr(name, gJailbreakPathMarkers[i])) return true;
+	}
+	return false;
+}
+
 // NOTE: this function runs on *every* file syscall in a hidden process
 // (stat/access/fopen/opendir/readdir/realpath/...), so it is deliberately a
 // straight sequence of cheap rejects that bail out as early as possible. An
@@ -267,10 +275,7 @@ bool __attribute__((optnone)) hidejb_rules_path_is_jailbreak(const char *path)
 	if (strncmp(path, "/usr/lib/", 9) == 0) {
 		const char *base = strrchr(path, '/');
 		base = base ? base + 1 : path;
-		for (size_t i = 0; i < sizeof(gJailbreakPathMarkers)/sizeof(gJailbreakPathMarkers[0]); i++) {
-			if (strstr(base, gJailbreakPathMarkers[i])) return true;
-		}
-		return false;
+		return hidejb_rules_matches_marker(base);
 	}
 
 	// Every hide rule is under /var/mobile. The vast majority of /var/mobile
@@ -299,10 +304,7 @@ bool __attribute__((optnone)) hidejb_rules_path_is_jailbreak(const char *path)
 	}
 
 	// Anything else (rare): only an embedded jailbreak marker matters.
-	for (size_t i = 0; i < sizeof(gJailbreakPathMarkers)/sizeof(gJailbreakPathMarkers[0]); i++) {
-		if (strstr(path, gJailbreakPathMarkers[i])) return true;
-	}
-	return false;
+	return hidejb_rules_matches_marker(path);
 }
 
 // True when the basename of `path` carries a jailbreak marker.
@@ -311,10 +313,7 @@ bool __attribute__((optnone)) hidejb_rules_path_has_marker(const char *path)
 	if (!path || !path[0]) return false;
 	const char *base = strrchr(path, '/');
 	base = base ? base + 1 : path;
-	for (size_t i = 0; i < sizeof(gJailbreakPathMarkers)/sizeof(gJailbreakPathMarkers[0]); i++) {
-		if (strstr(base, gJailbreakPathMarkers[i])) return true;
-	}
-	return false;
+	return hidejb_rules_matches_marker(base);
 }
 
 // Cheap per-entry decision for the readdir hook: `entryName` is a component

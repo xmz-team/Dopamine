@@ -389,6 +389,16 @@ static bool gNoInjectActive = false;
 // this counter the watchdog reads that window as "hidden with nothing running" and
 // restores on top of the hide that is still executing.
 static int gNoInjectHidePending = 0;
+// Set when a jailbreak app forced a resurrection while no-inject apps were still
+// running. The jailbreak is visible again, but we still owe it a re-hide once the
+// last no-inject app exits.
+//
+// This exists because clearing gNoInjectActive in the resurrection path broke the
+// invariant the whole design rests on: reconcile() treats "not active" as "nothing
+// to restore, ever". So after a resurrection the next no-inject app exit returned
+// early, and the jailbreak was left permanently visible — and, worse, permanently
+// un-hideable. Tracking the debt separately keeps both statements true at once.
+static bool gNoInjectSuspended = false;
 static pthread_mutex_t gNoInjectLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Serialises the hide/restore bodies themselves. They rename files, unmount and
@@ -517,9 +527,18 @@ static void app_hide_do_restore(void)
 		symlink(jbroot, "/var/jb");
 	}
 
-	// Restore the quarantined files, then remount fakelib.
-	app_hide_run_jbctl("audit", "restore");
+	// Order matters for how fast the jailbreak comes back.
+	//
+	// fakelib first: it is a single stat plus one bindfs mount, so /usr/lib is
+	// usable again almost immediately. "audit restore" afterwards has to move
+	// back every quarantined file and can take seconds; doing it second means
+	// tweaks and jailbreak binaries load again long before it finishes.
+	//
+	// The two are independent: neither depends on the other's result, and both
+	// are idempotent, so a failure in one does not leave the other in a state
+	// the watchdog cannot repair (it re-runs this function on its next tick).
 	app_hide_run_jbctl("fakelib", "mount");
+	app_hide_run_jbctl("audit", "restore");
 }
 
 // Record that a no-inject app was spawned. Called right after the bare spawn, so
@@ -551,18 +570,26 @@ void app_hide_abort_pending_hide(void)
 static void app_hide_reconcile(const char *reason)
 {
 	pthread_mutex_lock(&gNoInjectLock);
-	if (!gNoInjectActive) {
+	if (!gNoInjectActive && !gNoInjectSuspended) {
 		pthread_mutex_unlock(&gNoInjectLock);
 		return;
 	}
 	app_hide_reap_dead_pids_locked();
 	if (app_hide_should_stay_hidden_locked()) {
 		int tracked = (int)gNoInjectPidCount;
+		bool suspended = gNoInjectSuspended;
 		pthread_mutex_unlock(&gNoInjectLock);
-		app_hide_log([NSString stringWithFormat:@"reconcile(%s): staying hidden, %d no-inject app(s) alive", reason, tracked]);
+		app_hide_log([NSString stringWithFormat:@"reconcile(%s): staying hidden, %d no-inject app(s) alive%@",
+		              reason, tracked, suspended ? @" (suspended by jailbreak app)" : @""]);
 		return;
 	}
-	gNoInjectActive = false;
+
+	// Nothing is left to hide for. The debt from a resurrection is paid off here:
+	// this is the one path that can put the jailbreak back into the hidden state
+	// the still-open no-inject window needs.
+	bool rehide = gNoInjectSuspended;
+	gNoInjectActive = rehide;
+	gNoInjectSuspended = false;
 	gNoInjectPidCount = 0;
 	gNoInjectHidePending = 0;
 	pthread_mutex_unlock(&gNoInjectLock);
@@ -571,18 +598,32 @@ static void app_hide_reconcile(const char *reason)
 	// plain leaf lock, and taking it while waiting for a blocking jbctl call in
 	// the other order would serialise every spawn behind the hide.
 	pthread_mutex_lock(&gNoInjectActionLock);
-	app_hide_log([NSString stringWithFormat:@"reconcile(%s): no no-inject app left, restoring jailbreak", reason]);
-	app_hide_do_restore();
+	if (rehide) {
+		app_hide_log([NSString stringWithFormat:@"reconcile(%s): last no-inject app gone, re-hiding for resumed window", reason]);
+		app_hide_do_hide();
+	} else {
+		app_hide_log([NSString stringWithFormat:@"reconcile(%s): no no-inject app left, restoring jailbreak", reason]);
+		app_hide_do_restore();
+	}
 	pthread_mutex_unlock(&gNoInjectActionLock);
 }
 
 void app_hide_global_hide(void)
 {
 	pthread_mutex_lock(&gNoInjectLock);
+	// "Needs the jailbreak hidden" is active OR suspended: while a jailbreak app is
+	// forcing it visible, a newly launched no-inject app still needs its own hide,
+	// and treating the suspended state as "already hidden" would bare-spawn it
+	// straight into a visible jailbreak.
 	bool wasHidden = gNoInjectActive;
 	gNoInjectActive = true;
+	gNoInjectSuspended = false;
 	// Hide before spawning (the app must not see /var/jb), so until its pid is
 	// recorded the set is legitimately empty. Mark that so the watchdog waits.
+	//
+	// Note: entering here while suspended (the jailbreak was resurrected and is
+	// therefore currently visible) falls through to do_hide() below, which is
+	// exactly what that case needs.
 	if (!wasHidden) gNoInjectHidePending++;
 	pthread_mutex_unlock(&gNoInjectLock);
 	if (wasHidden) return;
@@ -606,6 +647,14 @@ bool app_hide_is_currently_hidden(void)
 	bool hidden = gNoInjectActive;
 	pthread_mutex_unlock(&gNoInjectLock);
 	return hidden;
+}
+
+bool app_hide_has_pending_no_inject_state(void)
+{
+	pthread_mutex_lock(&gNoInjectLock);
+	bool pending = gNoInjectSuspended || gNoInjectHidePending > 0;
+	pthread_mutex_unlock(&gNoInjectLock);
+	return pending;
 }
 
 bool app_hide_is_jailbreak_app(const char *path)
@@ -676,13 +725,26 @@ void app_hide_resurrect_for_jb_app(void)
 	// that un-hides until the apps are gone.
 	pthread_mutex_lock(&gNoInjectLock);
 	bool wasHidden = gNoInjectActive;
-	gNoInjectActive = false;
-	// The apps are still running, so the hide is suspended, not finished: reset
-	// the pending window and keep the pids for the watchdog to reason about.
-	gNoInjectHidePending = 0;
+	if (wasHidden) {
+		// Suspend, don't cancel: we still owe the running no-inject apps their
+		// hide. Clearing gNoInjectActive instead made reconcile() return early on
+		// their next exit, so the jailbreak was never hidden again for the rest of
+		// the session — "hiding mysteriously turned off".
+		//
+		// The active flag is cleared here rather than under the action lock: it is
+		// what tells a concurrent reconcile() that the restore is this thread's job,
+		// and clearing it first makes a racing reconcile() bail out instead of
+		// queueing a second do_restore() behind ours. Same ordering rule as
+		// reconcile() itself — gNoInjectLock is always released before the action
+		// lock is taken, so the two can never form a deadlock cycle.
+		gNoInjectSuspended = true;
+		gNoInjectActive = false;
+		gNoInjectHidePending = 0;
+	}
 	pthread_mutex_unlock(&gNoInjectLock);
 	if (!wasHidden) return;
 	app_hide_log(@"resurrect: jailbreak app spawned while hidden, restoring jailbreak");
+
 	pthread_mutex_lock(&gNoInjectActionLock);
 	app_hide_do_restore();
 	pthread_mutex_unlock(&gNoInjectActionLock);
@@ -808,11 +870,14 @@ static void app_hide_start_watchdog(void)
 	dispatch_once(&onceToken, ^{
 		dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
 			dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-		// 5s is frequent enough that a crashed app is recovered quickly, and rare
-		// enough that this costs nothing: the body returns immediately unless
-		// something is actually wrong.
-		dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-			5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+		// 2s rather than 5s: this is only a safety net for events that never arrive (a
+		// crashed app, a missed exit). The normal path is the exit watcher, which
+		// restores immediately, so the interval only decides how long a *missed*
+		// event stays invisible — and a hidden jailbreak looks exactly like
+		// "tweaks disappeared". The body returns immediately unless something is
+		// actually wrong, so the cost is a handful of cheap comparisons.
+		dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+			2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
 		dispatch_source_set_event_handler(timer, ^{
 			// Two independent checks, because a hide can go wrong in two ways:
 
@@ -820,7 +885,13 @@ static void app_hide_start_watchdog(void)
 			//    stranded case: a missed exit event, or a restore that was skipped
 			//    because bookkeeping disagreed with reality. Left alone it hides
 			//    /var/jb indefinitely, which is exactly "tweaks disappeared".
-			if (app_hide_is_currently_hidden()) {
+			//
+			//    Also covers the suspended case: reconcile() knows about that state
+			//    and re-hides when the last no-inject app is gone. It is deliberately
+			//    NOT gated on is_currently_hidden() alone — that flag is false while a
+			//    jailbreak app holds the jailbreak visible, and skipping the tick then
+			//    would strand the state forever.
+			if (app_hide_is_currently_hidden() || app_hide_has_pending_no_inject_state()) {
 				app_hide_reconcile("watchdog");
 				return;
 			}
